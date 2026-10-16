@@ -1,4 +1,4 @@
-import { GAME_SERVER_PORT, type ClientMessage, type PlayerState, type ServerMessage } from "./protocol";
+import { GAME_SOCKET_PATH, type ClientMessage, type PlayerState, type ServerMessage } from "./protocol";
 
 export type ConnectionStatus = "connecting" | "online" | "offline";
 
@@ -17,7 +17,7 @@ function sameState(a: PlayerState, b: PlayerState) {
   return a.x === b.x && a.z === b.z && a.yaw === b.yaw && a.anim === b.anim;
 }
 
-// Connects to the game server on the same host that served the page, reconnecting until closed.
+// Connects to the game server on the same host and port that served the page, reconnecting until closed.
 export function connectMultiplayer(handlers: MultiplayerHandlers) {
   let socket: WebSocket | undefined;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -29,7 +29,7 @@ export function connectMultiplayer(handlers: MultiplayerHandlers) {
     handlers.onStatus("connecting");
 
     const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${protocol}://${location.hostname}:${GAME_SERVER_PORT}`);
+    const ws = new WebSocket(`${protocol}://${location.host}${GAME_SOCKET_PATH}`);
     socket = ws;
 
     ws.onopen = () => {

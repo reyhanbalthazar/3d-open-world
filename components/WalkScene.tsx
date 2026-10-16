@@ -11,7 +11,13 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
 import { connectMultiplayer, type ConnectionStatus } from "@/lib/multiplayer";
 import type { AnimName as ActionName } from "@/lib/protocol";
+import { Radar } from "@/lib/radar";
 import { CLIP_INDEX, RemotePlayers } from "@/lib/remote-players";
+import { MAP_HALF, MAP_SIZE, PLAYER_RADIUS, yawFromQuaternion } from "@/lib/world";
+
+const RADAR_SIZE = 176;
+const WALL_HEIGHT = 1.2;
+const WALL_THICKNESS = 0.4;
 
 const STATUS_TEXT: Record<ConnectionStatus, string> = {
   connecting: "Connecting to game server…",
@@ -34,15 +40,16 @@ function setWeight(action: THREE.AnimationAction, weight: number) {
 
 export default function WalkScene() {
   const containerRef = useRef<HTMLDivElement>(null);
+  const radarRef = useRef<HTMLCanvasElement>(null);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [playerCount, setPlayerCount] = useState(1);
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!container) return;
+    const radarCanvas = radarRef.current;
+    if (!container || !radarCanvas) return;
 
     let disposed = false;
-    let floor: THREE.Mesh | undefined;
     let skeleton: THREE.SkeletonHelper | undefined;
     let mixer: THREE.AnimationMixer | undefined;
     let actions: Record<ActionName, THREE.AnimationAction> | undefined;
@@ -56,6 +63,7 @@ export default function WalkScene() {
     const controls = {
       key: [0, 0, 0],
       ease: new THREE.Vector3(),
+      moved: new THREE.Vector3(),
       position: new THREE.Vector3(),
       up: new THREE.Vector3(0, 1, 0),
       rotate: new THREE.Quaternion(),
@@ -64,7 +72,6 @@ export default function WalkScene() {
       runVelocity: 5,
       walkVelocity: 1.8,
       rotateSpeed: 0.05,
-      floorDecale: 0,
     };
 
     const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
@@ -137,6 +144,9 @@ export default function WalkScene() {
     orbitControls.target.copy(controls.position).add(controls.up);
     orbitControls.update();
 
+    const radar = new Radar(radarCanvas, RADAR_SIZE);
+    const viewDirection = new THREE.Vector3();
+
     // MULTIPLAYER
 
     const remotes = new RemotePlayers(scene);
@@ -165,9 +175,36 @@ export default function WalkScene() {
       },
     });
 
+    // Low walls just outside the square map, so the boundary is visible.
+    function addWalls() {
+      const material = new THREE.MeshStandardMaterial({ color: 0x8a8a8a, roughness: 0.6, metalness: 0.1 });
+      const length = MAP_SIZE + WALL_THICKNESS * 2;
+      const offset = MAP_HALF + WALL_THICKNESS / 2;
+
+      const sides: Array<[x: number, z: number, rotated: boolean]> = [
+        [0, offset, false],
+        [0, -offset, false],
+        [offset, 0, true],
+        [-offset, 0, true],
+      ];
+
+      for (const [x, z, rotated] of sides) {
+        const wall = new THREE.Mesh(new THREE.BoxGeometry(length, WALL_HEIGHT, WALL_THICKNESS), material);
+        wall.position.set(x, WALL_HEIGHT / 2, z);
+        if (rotated) wall.rotation.y = PI90;
+        wall.castShadow = true;
+        wall.receiveShadow = true;
+        scene.add(wall);
+      }
+    }
+
+    addWalls();
+
     function addFloor() {
-      const size = 50;
-      const repeat = 16;
+      // a little wider than the map so the walls don't stand on the edge of the world
+      const size = MAP_SIZE + 20;
+      // same tile size as the original 50 m floor with 16 repeats
+      const repeat = size / (50 / 16);
 
       const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
 
@@ -194,11 +231,9 @@ export default function WalkScene() {
       const g = new THREE.PlaneGeometry(size, size, 50, 50);
       g.rotateX(-PI90);
 
-      floor = new THREE.Mesh(g, mat);
+      const floor = new THREE.Mesh(g, mat);
       floor.receiveShadow = true;
       scene.add(floor);
-
-      controls.floorDecale = (size / repeat) * 4;
 
       const bulbGeometry = new THREE.SphereGeometry(0.05, 16, 8);
       const bulbLight = new THREE.PointLight(0xffee88, 2, 500, 2);
@@ -320,21 +355,18 @@ export default function WalkScene() {
         // apply camera angle on ease
         controls.ease.applyAxisAngle(up, azimuth);
 
+        // stay inside the square map; the camera follows by however far the player really moved
+        const limit = MAP_HALF - PLAYER_RADIUS;
+        const moved = controls.moved.copy(position);
         position.add(ease);
-        camera.position.add(ease);
+        position.x = THREE.MathUtils.clamp(position.x, -limit, limit);
+        position.z = THREE.MathUtils.clamp(position.z, -limit, limit);
+        camera.position.add(moved.subVectors(position, moved));
 
         group.position.copy(position);
         group.quaternion.rotateTowards(rotate, controls.rotateSpeed);
 
         orbitControls.target.copy(position).add(up);
-
-        // Move the floor without any limit
-        if (floor) {
-          const dx = position.x - floor.position.x;
-          const dz = position.z - floor.position.z;
-          if (Math.abs(dx) > controls.floorDecale) floor.position.x += dx;
-          if (Math.abs(dz) > controls.floorDecale) floor.position.z += dz;
-        }
       }
 
       if (mixer) mixer.update(delta);
@@ -343,7 +375,11 @@ export default function WalkScene() {
     }
 
     function createPanel() {
-      panel = new GUI({ width: 310 });
+      panel = new GUI({ width: RADAR_SIZE });
+      // the radar owns the top-right corner, so tuck the panel underneath it
+      panel.domElement.style.top = `${RADAR_SIZE + 24}px`;
+      panel.domElement.style.right = "12px";
+      panel.close();
 
       panel.add(settings, "show_skeleton").onChange((b: boolean) => {
         if (skeleton) skeleton.visible = b;
@@ -388,15 +424,24 @@ export default function WalkScene() {
       updateCharacter(delta);
       remotes.update(delta);
 
+      const yaw = yawFromQuaternion(group.quaternion);
+
       net.sendState({
         x: controls.position.x,
         z: controls.position.z,
-        // the group only ever rotates around Y, so its quaternion is (0, sin(yaw/2), 0, cos(yaw/2))
-        yaw: 2 * Math.atan2(group.quaternion.y, group.quaternion.w),
+        yaw,
         anim: controls.current,
       });
 
       renderer.render(scene, camera);
+
+      viewDirection.subVectors(orbitControls.target, camera.position);
+      radar.draw(
+        { x: controls.position.x, z: controls.position.z, yaw, color: "#ffffff" },
+        viewDirection.x,
+        viewDirection.z,
+        remotes.markers(),
+      );
     }
 
     // EVENTS
@@ -462,6 +507,12 @@ export default function WalkScene() {
   return (
     <div className="fixed inset-0 overflow-hidden bg-[#5e5d5d]">
       <div ref={containerRef} />
+      <canvas
+        ref={radarRef}
+        aria-label="Radar map"
+        className="pointer-events-none absolute top-3 right-3 rounded-xl border border-white/15 bg-black/55 shadow-lg backdrop-blur-sm"
+        style={{ width: RADAR_SIZE, height: RADAR_SIZE }}
+      />
       <div className="pointer-events-none absolute inset-x-0 top-0 p-2.5 text-center font-mono text-[13px] leading-snug text-white select-none">
         <a
           className="pointer-events-auto text-[#f00]"

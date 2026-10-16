@@ -1,7 +1,7 @@
-// Messages exchanged between the browser and server/game-server.mts over WebSocket.
+// Messages exchanged between the browser and server/game.ts over WebSocket.
 
-// Keep in sync with GAME_PORT in server/game-server.mts.
-export const GAME_SERVER_PORT = 3001;
+// Served by the same host and port as the game page.
+export const GAME_SOCKET_PATH = "/ws";
 
 export type AnimName = "Idle" | "Walk" | "Run";
 

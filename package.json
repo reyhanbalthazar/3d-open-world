@@ -2,10 +2,14 @@
   "name": "3d-open-world",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
-    "dev": "concurrently -k -n next,game -c blue,magenta \"next dev\" \"node --watch server/game-server.mts\"",
+    "dev": "node --watch-path=server server/index.ts --dev",
     "build": "next build",
-    "start": "concurrently -k -n next,game -c blue,magenta \"next start\" \"node server/game-server.mts\"",
+    "start": "node server/index.ts",
     "lint": "eslint"
   },
   "dependencies": {
@@ -22,7 +26,6 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/ws": "^8.18.2",
-    "concurrently": "^10.0.6",
     "eslint": "^9",
     "eslint-config-next": "16.4.2",
     "tailwindcss": "^4",

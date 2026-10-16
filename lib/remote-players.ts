@@ -2,6 +2,8 @@ import * as THREE from "three";
 import type { GLTF } from "three/addons/loaders/GLTFLoader.js";
 import { clone as cloneSkinned } from "three/addons/utils/SkeletonUtils.js";
 import type { AnimName, PlayerState } from "./protocol";
+import type { RadarMarker } from "./radar";
+import { yawFromQuaternion } from "./world";
 
 // Index of each animation clip inside Soldier.glb.
 export const CLIP_INDEX: Record<AnimName, number> = { Idle: 0, Walk: 3, Run: 1 };
@@ -18,6 +20,7 @@ interface RemotePlayer {
   target: THREE.Vector3;
   targetRotation: THREE.Quaternion;
   materials: THREE.Material[];
+  color: string;
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -80,6 +83,13 @@ export class RemotePlayers {
     this.pending.clear();
   }
 
+  *markers(): Generator<RadarMarker> {
+    for (const player of this.players.values()) {
+      const { position, quaternion } = player.group;
+      yield { x: position.x, z: position.z, yaw: yawFromQuaternion(quaternion), color: player.color };
+    }
+  }
+
   update(delta: number) {
     const t = 1 - Math.exp(-SMOOTHING * delta);
 
@@ -130,6 +140,7 @@ export class RemotePlayers {
       target: group.position.clone(),
       targetRotation: group.quaternion.clone(),
       materials,
+      color: tint.getStyle(),
     };
     this.players.set(id, player);
     return player;
