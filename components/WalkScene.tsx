@@ -93,6 +93,34 @@ export default function WalkScene() {
     orbitControls.maxPolarAngle = PI90 - 0.05;
     orbitControls.update();
 
+    // OrbitControls turns Shift + left drag into a pan (disabled above), so the camera
+    // froze while running. Re-dispatch the press without Shift so it rotates instead.
+    function onCanvasPointerDown(event: PointerEvent) {
+      if (!event.shiftKey || event.button !== 0) return;
+      event.stopImmediatePropagation();
+      renderer.domElement.dispatchEvent(
+        new PointerEvent("pointerdown", {
+          bubbles: event.bubbles,
+          cancelable: event.cancelable,
+          composed: event.composed,
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          isPrimary: event.isPrimary,
+          button: event.button,
+          buttons: event.buttons,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          screenX: event.screenX,
+          screenY: event.screenY,
+          altKey: event.altKey,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+          shiftKey: false,
+        }),
+      );
+    }
+    renderer.domElement.addEventListener("pointerdown", onCanvasPointerDown, { capture: true });
+
     function addFloor() {
       const size = 50;
       const repeat = 16;
@@ -346,6 +374,7 @@ export default function WalkScene() {
       window.removeEventListener("resize", onWindowResize);
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("keyup", onKeyUp);
+      renderer.domElement.removeEventListener("pointerdown", onCanvasPointerDown, { capture: true });
 
       renderer.setAnimationLoop(null);
       panel?.destroy();
