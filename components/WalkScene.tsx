@@ -2,15 +2,22 @@
 
 // Port of https://threejs.org/examples/#webgl_animation_walk (MIT, three.js authors).
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { SunLight } from "three/addons/lights/SunLight.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GUI } from "three/addons/libs/lil-gui.module.min.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
+import { connectMultiplayer, type ConnectionStatus } from "@/lib/multiplayer";
+import type { AnimName as ActionName } from "@/lib/protocol";
+import { CLIP_INDEX, RemotePlayers } from "@/lib/remote-players";
 
-type ActionName = "Idle" | "Walk" | "Run";
+const STATUS_TEXT: Record<ConnectionStatus, string> = {
+  connecting: "Connecting to game server…",
+  online: "Online",
+  offline: "Offline: game server unreachable, retrying…",
+};
 
 const PI = Math.PI;
 const PI90 = Math.PI / 2;
@@ -27,6 +34,8 @@ function setWeight(action: THREE.AnimationAction, weight: number) {
 
 export default function WalkScene() {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  const [playerCount, setPlayerCount] = useState(1);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -121,6 +130,41 @@ export default function WalkScene() {
     }
     renderer.domElement.addEventListener("pointerdown", onCanvasPointerDown, { capture: true });
 
+    // Spawn at a random spot near the origin so players don't stand inside each other.
+    controls.position.set(THREE.MathUtils.randFloatSpread(6), 0, THREE.MathUtils.randFloatSpread(6));
+    group.position.copy(controls.position);
+    camera.position.add(controls.position);
+    orbitControls.target.copy(controls.position).add(controls.up);
+    orbitControls.update();
+
+    // MULTIPLAYER
+
+    const remotes = new RemotePlayers(scene);
+    const updatePlayerCount = () => setPlayerCount(remotes.count + 1);
+
+    const net = connectMultiplayer({
+      onWelcome(_id, players) {
+        remotes.clear();
+        for (const { id, ...state } of players) remotes.upsert(id, state);
+        updatePlayerCount();
+      },
+      onState(id, state) {
+        remotes.upsert(id, state);
+        updatePlayerCount();
+      },
+      onLeave(id) {
+        remotes.remove(id);
+        updatePlayerCount();
+      },
+      onStatus(next) {
+        setStatus(next);
+        if (next !== "online") {
+          remotes.clear();
+          updatePlayerCount();
+        }
+      },
+    });
+
     function addFloor() {
       const size = 50;
       const repeat = 16;
@@ -207,9 +251,9 @@ export default function WalkScene() {
         mixer = new THREE.AnimationMixer(model);
 
         actions = {
-          Idle: mixer.clipAction(animations[0]),
-          Walk: mixer.clipAction(animations[3]),
-          Run: mixer.clipAction(animations[1]),
+          Idle: mixer.clipAction(animations[CLIP_INDEX.Idle]),
+          Walk: mixer.clipAction(animations[CLIP_INDEX.Walk]),
+          Run: mixer.clipAction(animations[CLIP_INDEX.Run]),
         };
 
         for (const m of Object.keys(actions) as ActionName[]) {
@@ -219,6 +263,8 @@ export default function WalkScene() {
         }
 
         actions.Idle.play();
+
+        remotes.setTemplate(gltf);
       });
     }
 
@@ -340,6 +386,15 @@ export default function WalkScene() {
       const delta = timer.getDelta();
 
       updateCharacter(delta);
+      remotes.update(delta);
+
+      net.sendState({
+        x: controls.position.x,
+        z: controls.position.z,
+        // the group only ever rotates around Y, so its quaternion is (0, sin(yaw/2), 0, cos(yaw/2))
+        yaw: 2 * Math.atan2(group.quaternion.y, group.quaternion.w),
+        anim: controls.current,
+      });
 
       renderer.render(scene, camera);
     }
@@ -377,6 +432,8 @@ export default function WalkScene() {
       renderer.domElement.removeEventListener("pointerdown", onCanvasPointerDown, { capture: true });
 
       renderer.setAnimationLoop(null);
+      net.close();
+      remotes.clear();
       panel?.destroy();
       orbitControls.dispose();
       timer.dispose();
@@ -426,6 +483,11 @@ export default function WalkScene() {
         )
         <br />
         WASD / arrows to move, Shift to run, drag to orbit the camera
+        <br />
+        <span className={status === "online" ? "text-emerald-300" : "text-amber-300"}>
+          {STATUS_TEXT[status]}
+          {status === "online" && ` · ${playerCount} ${playerCount === 1 ? "player" : "players"}`}
+        </span>
       </div>
     </div>
   );
