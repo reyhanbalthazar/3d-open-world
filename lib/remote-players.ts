@@ -1,71 +1,123 @@
 import * as THREE from "three";
 import type { GLTF } from "three/addons/loaders/GLTFLoader.js";
-import { clone as cloneSkinned } from "three/addons/utils/SkeletonUtils.js";
-import type { AnimName, PlayerState } from "./protocol";
+import { CSS2DObject } from "three/addons/renderers/CSS2DRenderer.js";
+import {
+  createActions,
+  createFootPins,
+  instantiateCharacter,
+  loadCharacterModel,
+  mixamoWeight,
+  type CharacterActions,
+} from "./character-models";
+import type { CharacterId } from "./characters";
+import type { AnimName, LocomotionName, PlayerInfo, PlayerState } from "./protocol";
 import type { RadarMarker } from "./radar";
 import { yawFromQuaternion } from "./world";
-
-// Index of each animation clip inside Soldier.glb.
-export const CLIP_INDEX: Record<AnimName, number> = { Idle: 0, Walk: 3, Run: 1 };
 
 const FADE_DURATION = 0.3;
 const SMOOTHING = 12;
 const SNAP_DISTANCE = 5;
+// just above the head of the Quaternius characters (~1.85 m tall)
+const LABEL_HEIGHT = 2.15;
+
+interface Profile {
+  name: string;
+  character: CharacterId;
+  // marker colour on the radar and the name tag
+  color: string;
+}
 
 interface RemotePlayer {
   group: THREE.Group;
   mixer: THREE.AnimationMixer;
-  actions: Record<AnimName, THREE.AnimationAction>;
+  actions: CharacterActions;
   current: AnimName;
+  feet: ReturnType<typeof createFootPins>;
   target: THREE.Vector3;
   targetRotation: THREE.Quaternion;
-  materials: THREE.Material[];
+  label: CSS2DObject;
   color: string;
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
 
-function hueFromId(id: string) {
+const isLocomotion = (anim: AnimName): anim is LocomotionName => anim === "Idle" || anim === "Walk" || anim === "Run";
+const isStride = (anim: AnimName) => anim === "Walk" || anim === "Run";
+
+function colorFromId(id: string) {
   let hash = 0;
   for (const char of id) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  return (hash % 360) / 360;
+  return new THREE.Color().setHSL((hash % 360) / 360, 0.7, 0.6).getStyle();
 }
 
-// Other players in the world, cloned from the local Soldier model and tinted per player.
+function createLabel(profile: Profile) {
+  const element = document.createElement("div");
+  element.className =
+    "rounded-md border-l-[3px] bg-black/60 px-1.5 py-0.5 font-sans text-xs font-medium whitespace-nowrap text-white";
+  element.style.borderLeftColor = profile.color;
+  element.textContent = profile.name;
+
+  const label = new CSS2DObject(element);
+  label.position.set(0, LABEL_HEIGHT, 0);
+  return label;
+}
+
+// Other players in the world, each with the character they picked and a name tag.
 export class RemotePlayers {
+  private profiles = new Map<string, Profile>();
   private players = new Map<string, RemotePlayer>();
+  // latest position of players whose character model is still downloading
   private pending = new Map<string, PlayerState>();
-  private template: GLTF | undefined;
   private scene: THREE.Scene;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
   }
 
+  // players who have joined, whether or not they have moved yet
   get count() {
-    return this.players.size + this.pending.size;
+    return this.profiles.size;
   }
 
-  // Players can join before the model has loaded; they spawn once it is available.
-  setTemplate(gltf: GLTF) {
-    this.template = gltf;
-    for (const [id, state] of this.pending) this.upsert(id, state);
-    this.pending.clear();
+  names() {
+    return [...this.profiles.values()].map((profile) => profile.name);
+  }
+
+  add(player: PlayerInfo) {
+    this.profiles.set(player.id, { name: player.name, character: player.character, color: colorFromId(player.id) });
+    if (player.state) this.upsert(player.id, player.state);
   }
 
   upsert(id: string, state: PlayerState) {
-    if (!this.template) {
-      this.pending.set(id, state);
+    const player = this.players.get(id);
+    if (player) {
+      player.target.set(state.x, 0, state.z);
+      player.targetRotation.setFromAxisAngle(UP, state.yaw);
+      this.play(player, state.anim);
       return;
     }
 
-    const player = this.players.get(id) ?? this.spawn(id, state);
-    player.target.set(state.x, 0, state.z);
-    player.targetRotation.setFromAxisAngle(UP, state.yaw);
-    this.play(player, state.anim);
+    const profile = this.profiles.get(id);
+    if (!profile) return;
+
+    const loading = this.pending.has(id);
+    this.pending.set(id, state);
+    if (loading) return;
+
+    loadCharacterModel(profile.character).then(
+      (gltf) => {
+        const latest = this.pending.get(id);
+        // the player may have left (or we reconnected) while the model downloaded
+        if (!latest || this.profiles.get(id) !== profile) return;
+        this.pending.delete(id);
+        this.spawn(id, profile, gltf, latest);
+      },
+      (error) => console.error(`Could not load character "${profile.character}"`, error),
+    );
   }
 
   remove(id: string) {
+    this.profiles.delete(id);
     this.pending.delete(id);
 
     const player = this.players.get(id);
@@ -73,14 +125,14 @@ export class RemotePlayers {
 
     player.mixer.stopAllAction();
     player.mixer.uncacheRoot(player.group);
+    // the label's DOM element is only removed when the label itself leaves the scene graph
+    player.label.removeFromParent();
     this.scene.remove(player.group);
-    for (const material of player.materials) material.dispose();
     this.players.delete(id);
   }
 
   clear() {
-    for (const id of [...this.players.keys()]) this.remove(id);
-    this.pending.clear();
+    for (const id of [...this.profiles.keys()]) this.remove(id);
   }
 
   *markers(): Generator<RadarMarker> {
@@ -101,61 +153,52 @@ export class RemotePlayers {
       }
       player.group.quaternion.slerp(player.targetRotation, t);
       player.mixer.update(delta);
+      player.feet.update(mixamoWeight(player.actions));
     }
   }
 
-  private spawn(id: string, state: PlayerState) {
-    const template = this.template!;
-    const model = cloneSkinned(template.scene);
-    const tint = new THREE.Color().setHSL(hueFromId(id), 0.7, 0.6);
-    const materials: THREE.Material[] = [];
-
-    model.traverse((object) => {
-      if (!(object instanceof THREE.Mesh)) return;
-      const material = (object.material as THREE.MeshStandardMaterial).clone();
-      material.color.copy(tint);
-      object.material = material;
-      materials.push(material);
-    });
+  private spawn(id: string, profile: Profile, gltf: GLTF, state: PlayerState) {
+    const model = instantiateCharacter(gltf);
+    const label = createLabel(profile);
 
     const group = new THREE.Group();
-    group.add(model);
+    group.add(model, label);
     group.position.set(state.x, 0, state.z);
     group.quaternion.setFromAxisAngle(UP, state.yaw);
     this.scene.add(group);
 
     const mixer = new THREE.AnimationMixer(model);
-    const actions = {
-      Idle: mixer.clipAction(template.animations[CLIP_INDEX.Idle]),
-      Walk: mixer.clipAction(template.animations[CLIP_INDEX.Walk]),
-      Run: mixer.clipAction(template.animations[CLIP_INDEX.Run]),
-    };
-    actions[state.anim].play();
+    const actions = createActions(mixer, gltf.animations);
+    // someone first seen in the middle of a move just stands until their next update
+    const current = isLocomotion(state.anim) ? state.anim : "Idle";
+    actions[current].play();
 
-    const player: RemotePlayer = {
+    this.players.set(id, {
       group,
       mixer,
       actions,
-      current: state.anim,
+      current,
+      feet: createFootPins(model),
       target: group.position.clone(),
       targetRotation: group.quaternion.clone(),
-      materials,
-      color: tint.getStyle(),
-    };
-    this.players.set(id, player);
-    return player;
+      label,
+      color: profile.color,
+    });
   }
 
   private play(player: RemotePlayer, anim: AnimName) {
     if (player.current === anim) return;
 
-    const old = player.actions[player.current];
+    // a move whose animation failed to load is skipped
     const next = player.actions[anim];
+    if (!next) return;
+    const old = player.actions[player.current]!;
+    const previous = player.current;
     player.current = anim;
 
     next.reset();
     // keep the feet in step when switching between walk and run
-    if (anim !== "Idle") next.time = old.time * (next.getClip().duration / old.getClip().duration);
+    if (isStride(anim) && isStride(previous)) next.time = old.time * (next.getClip().duration / old.getClip().duration);
     next.fadeIn(FADE_DURATION).play();
     old.fadeOut(FADE_DURATION);
   }

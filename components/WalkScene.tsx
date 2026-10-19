@@ -7,17 +7,36 @@ import * as THREE from "three";
 import { SunLight } from "three/addons/lights/SunLight.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GUI } from "three/addons/libs/lil-gui.module.min.js";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
+import { CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
+import JoinModal from "@/components/JoinModal";
+import type { MixamoAnimationName } from "@/lib/animation-catalog";
+import {
+  createActions,
+  createFootPins,
+  instantiateCharacter,
+  loadCharacterModel,
+  mixamoWeight,
+  type CharacterActions,
+} from "@/lib/character-models";
+import { DEFAULT_CHARACTER, type CharacterId } from "@/lib/characters";
 import { connectMultiplayer, type ConnectionStatus } from "@/lib/multiplayer";
-import type { AnimName as ActionName } from "@/lib/protocol";
+import { addNature, createGround } from "@/lib/nature";
+import { loadSavedProfile, saveProfile, type SavedProfile } from "@/lib/profile";
+import type { JoinErrorReason, LocomotionName as ActionName } from "@/lib/protocol";
 import { Radar } from "@/lib/radar";
-import { CLIP_INDEX, RemotePlayers } from "@/lib/remote-players";
+import { RemotePlayers } from "@/lib/remote-players";
+import { createMonument, MONUMENT_OBSTACLES, MONUMENT_POSITION } from "@/lib/monument";
+import { createSky, HORIZON_COLOR } from "@/lib/sky";
+import { CLEARING_RADIUS, generateTerrainLayout } from "@/lib/terrain-layout";
 import { MAP_HALF, MAP_SIZE, PLAYER_RADIUS, yawFromQuaternion } from "@/lib/world";
 
 const RADAR_SIZE = 176;
-const WALL_HEIGHT = 1.2;
-const WALL_THICKNESS = 0.4;
+// seconds to blend into and back out of a move like the sword slash
+const MOVE_FADE = 0.2;
+const SUN_COLOR = 0xfff0d6;
+const SUN_DIRECTION = new THREE.Vector3(0.6, 0.7, 0.35).normalize();
+// ground beyond the map edge, far enough that its end is always lost in the fog
+const GROUND_MARGIN = 50;
 
 const STATUS_TEXT: Record<ConnectionStatus, string> = {
   connecting: "Connecting to game server…",
@@ -38,11 +57,26 @@ function setWeight(action: THREE.AnimationAction, weight: number) {
   action.setEffectiveWeight(weight);
 }
 
+// What the join screen can ask of the running scene.
+interface SceneApi {
+  preview(character: CharacterId): void;
+  join(name: string, character: CharacterId): void;
+}
+
 export default function WalkScene() {
   const containerRef = useRef<HTMLDivElement>(null);
   const radarRef = useRef<HTMLCanvasElement>(null);
+  const sceneApiRef = useRef<SceneApi | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
-  const [playerCount, setPlayerCount] = useState(1);
+  const [playerCount, setPlayerCount] = useState(0);
+  const [takenNames, setTakenNames] = useState<string[]>([]);
+  // the join screen appears once the first character preview has loaded
+  const [sceneReady, setSceneReady] = useState(false);
+  const [loadProgress, setLoadProgress] = useState<number | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [joined, setJoined] = useState(false);
+  const [joining, setJoining] = useState(false);
+  const [joinError, setJoinError] = useState<JoinErrorReason | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -50,9 +84,16 @@ export default function WalkScene() {
     if (!container || !radarCanvas) return;
 
     let disposed = false;
+    // movement keys do nothing until the join screen is done
+    let joined = false;
+    let profile: SavedProfile | undefined;
+    let model: THREE.Object3D | undefined;
     let skeleton: THREE.SkeletonHelper | undefined;
     let mixer: THREE.AnimationMixer | undefined;
-    let actions: Record<ActionName, THREE.AnimationAction> | undefined;
+    let actions: CharacterActions | undefined;
+    let feet: ReturnType<typeof createFootPins> | undefined;
+    // the move playing right now (e.g. "Slash"), if any
+    let move: MixamoAnimationName | null = null;
     let panel: GUI | undefined;
 
     const settings = {
@@ -81,26 +122,41 @@ export default function WalkScene() {
     timer.connect(document);
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x5e5d5d);
-    scene.fog = new THREE.Fog(0x5e5d5d, 2, 20);
+    scene.background = new THREE.Color(HORIZON_COLOR);
+    scene.fog = new THREE.Fog(HORIZON_COLOR, 18, 50);
 
     const group = new THREE.Group();
+    group.rotation.y = PI;
     scene.add(group);
 
-    const sunLight = new SunLight(0xffffff, 5);
-    sunLight.position.set(-2, 5, -3);
+    // warm afternoon sun, high and off to the side of the spawn view
+    const sunLight = new SunLight(SUN_COLOR, 2.6);
+    sunLight.position.copy(SUN_DIRECTION).multiplyScalar(10);
     sunLight.castShadow = true;
     sunLight.shadow.camera.far = 20;
     scene.add(sunLight);
 
+    // soft fill: sky blue from above, grass green bounced from below
+    scene.add(new THREE.HemisphereLight(0xd6ecff, 0x7aa63f, 2.2));
+
+    const sky = createSky(SUN_DIRECTION);
+    scene.add(sky.object);
+
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 0.5;
+    // keeps the pack's saturated colours instead of washing them out like ACES does
+    renderer.toneMapping = THREE.NeutralToneMapping;
+    renderer.toneMappingExposure = 1;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFShadowMap;
     container.appendChild(renderer.domElement);
+
+    // name tags above other players
+    const labelRenderer = new CSS2DRenderer();
+    labelRenderer.setSize(window.innerWidth, window.innerHeight);
+    labelRenderer.domElement.className = "pointer-events-none absolute inset-0";
+    container.appendChild(labelRenderer.domElement);
 
     const orbitControls = new OrbitControls(camera, renderer.domElement);
     orbitControls.target.set(0, 1, 0);
@@ -137,170 +193,147 @@ export default function WalkScene() {
     }
     renderer.domElement.addEventListener("pointerdown", onCanvasPointerDown, { capture: true });
 
-    // Spawn at a random spot near the origin so players don't stand inside each other.
-    controls.position.set(THREE.MathUtils.randFloatSpread(6), 0, THREE.MathUtils.randFloatSpread(6));
+    // Spawn at a random spot on the south side of the central clearing, so players don't stand
+    // inside each other and the first thing they see is the monument's gate and tower.
+    controls.position.set(THREE.MathUtils.randFloatSpread(8), 0, -THREE.MathUtils.randFloat(8.5, 10.5));
     group.position.copy(controls.position);
     camera.position.add(controls.position);
     orbitControls.target.copy(controls.position).add(controls.up);
     orbitControls.update();
 
-    const radar = new Radar(radarCanvas, RADAR_SIZE);
+    const terrain = generateTerrainLayout();
+    const obstacles = [...terrain.obstacles, ...MONUMENT_OBSTACLES];
+    const radar = new Radar(radarCanvas, RADAR_SIZE, terrain.obstacles, MONUMENT_POSITION);
     const viewDirection = new THREE.Vector3();
 
     // MULTIPLAYER
 
     const remotes = new RemotePlayers(scene);
-    const updatePlayerCount = () => setPlayerCount(remotes.count + 1);
+    const refreshPlayers = () => {
+      setPlayerCount(remotes.count + (joined ? 1 : 0));
+      setTakenNames(remotes.names());
+    };
 
     const net = connectMultiplayer({
-      onWelcome(_id, players) {
+      onWelcome(players) {
         remotes.clear();
-        for (const { id, ...state } of players) remotes.upsert(id, state);
-        updatePlayerCount();
+        for (const player of players) remotes.add(player);
+        refreshPlayers();
+      },
+      onJoined() {
+        joined = true;
+        if (profile) saveProfile(profile);
+        setJoined(true);
+        setJoining(false);
+        refreshPlayers();
+      },
+      onJoinError(reason) {
+        setJoinError(reason);
+        setJoining(false);
+      },
+      onPlayerJoined(player) {
+        remotes.add(player);
+        refreshPlayers();
       },
       onState(id, state) {
         remotes.upsert(id, state);
-        updatePlayerCount();
       },
       onLeave(id) {
         remotes.remove(id);
-        updatePlayerCount();
+        refreshPlayers();
       },
       onStatus(next) {
         setStatus(next);
         if (next !== "online") {
           remotes.clear();
-          updatePlayerCount();
+          refreshPlayers();
         }
       },
     });
 
-    // Low walls just outside the square map, so the boundary is visible.
-    function addWalls() {
-      const material = new THREE.MeshStandardMaterial({ color: 0x8a8a8a, roughness: 0.6, metalness: 0.1 });
-      const length = MAP_SIZE + WALL_THICKNESS * 2;
-      const offset = MAP_HALF + WALL_THICKNESS / 2;
+    sceneApiRef.current = {
+      preview(character) {
+        void showCharacter(character);
+      },
+      join(name, character) {
+        profile = { name, character };
+        setJoining(true);
+        setJoinError(null);
+        void showCharacter(character);
+        net.join(name, character);
+      },
+    };
 
-      const sides: Array<[x: number, z: number, rotated: boolean]> = [
-        [0, offset, false],
-        [0, -offset, false],
-        [offset, 0, true],
-        [-offset, 0, true],
-      ];
+    // TERRAIN: grass ground, a forest border hiding the map edge, and trees, rocks, bushes,
+    // flowers and grass inside, laid out the same way for every player
 
-      for (const [x, z, rotated] of sides) {
-        const wall = new THREE.Mesh(new THREE.BoxGeometry(length, WALL_HEIGHT, WALL_THICKNESS), material);
-        wall.position.set(x, WALL_HEIGHT / 2, z);
-        if (rotated) wall.rotation.y = PI90;
-        wall.castShadow = true;
-        wall.receiveShadow = true;
-        scene.add(wall);
+    scene.add(
+      createGround(MAP_SIZE + GROUND_MARGIN * 2, terrain.paths, CLEARING_RADIUS, renderer.capabilities.getMaxAnisotropy()),
+    );
+    void addNature(scene, terrain.placements, () => disposed);
+
+    const monument = createMonument();
+    scene.add(monument.object);
+
+    // Swaps the local player's model; used for the join screen preview and the final pick.
+    // Quaternius characters already face +Z, so unlike the original Soldier the model needs no flip.
+    let characterRequest = 0;
+    async function showCharacter(character: CharacterId, onProgress?: (fraction: number) => void) {
+      const request = ++characterRequest;
+      const gltf = await loadCharacterModel(character, onProgress);
+      // unmounted, or another character was picked while this one downloaded
+      if (disposed || request !== characterRequest) return;
+
+      if (model) {
+        mixer?.stopAllAction();
+        mixer?.uncacheRoot(model);
+        group.remove(model);
       }
+      if (skeleton) {
+        scene.remove(skeleton);
+        skeleton.dispose();
+      }
+
+      model = instantiateCharacter(gltf);
+      group.add(model);
+
+      skeleton = new THREE.SkeletonHelper(model);
+      skeleton.setColors(new THREE.Color(0xe000ff), new THREE.Color(0x00e0ff));
+      skeleton.visible = settings.show_skeleton;
+      scene.add(skeleton);
+
+      mixer = new THREE.AnimationMixer(model);
+      actions = createActions(mixer, gltf.animations);
+      feet = createFootPins(model);
+
+      for (const m of ["Idle", "Walk", "Run"] as const) {
+        actions[m].enabled = true;
+        actions[m].setEffectiveTimeScale(1);
+        if (m !== "Idle") actions[m].setEffectiveWeight(0);
+      }
+
+      controls.current = "Idle";
+      move = null;
+      actions.Idle.play();
     }
 
-    addWalls();
-
-    function addFloor() {
-      // a little wider than the map so the walls don't stand on the edge of the world
-      const size = MAP_SIZE + 20;
-      // same tile size as the original 50 m floor with 16 repeats
-      const repeat = size / (50 / 16);
-
-      const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
-
-      const floorT = new THREE.TextureLoader().load("/textures/floors/FloorsCheckerboard_S_Diffuse.jpg");
-      floorT.colorSpace = THREE.SRGBColorSpace;
-      floorT.repeat.set(repeat, repeat);
-      floorT.wrapS = floorT.wrapT = THREE.RepeatWrapping;
-      floorT.anisotropy = maxAnisotropy;
-
-      const floorN = new THREE.TextureLoader().load("/textures/floors/FloorsCheckerboard_S_Normal.jpg");
-      floorN.repeat.set(repeat, repeat);
-      floorN.wrapS = floorN.wrapT = THREE.RepeatWrapping;
-      floorN.anisotropy = maxAnisotropy;
-
-      const mat = new THREE.MeshStandardMaterial({
-        map: floorT,
-        normalMap: floorN,
-        normalScale: new THREE.Vector2(0.5, 0.5),
-        color: 0x404040,
-        depthWrite: false,
-        roughness: 0.85,
-      });
-
-      const g = new THREE.PlaneGeometry(size, size, 50, 50);
-      g.rotateX(-PI90);
-
-      const floor = new THREE.Mesh(g, mat);
-      floor.receiveShadow = true;
-      scene.add(floor);
-
-      const bulbGeometry = new THREE.SphereGeometry(0.05, 16, 8);
-      const bulbLight = new THREE.PointLight(0xffee88, 2, 500, 2);
-
-      const bulbMat = new THREE.MeshStandardMaterial({ emissive: 0xffffee, emissiveIntensity: 1, color: 0x000000 });
-      bulbLight.add(new THREE.Mesh(bulbGeometry, bulbMat));
-      bulbLight.position.set(1, 0.1, -3);
-      bulbLight.castShadow = true;
-      floor.add(bulbLight);
+    // A move (Space: sword slash) plays once, cross-fading from whatever the legs were doing...
+    function startMove(name: MixamoAnimationName) {
+      const action = actions?.[name];
+      if (!actions || !action || move) return;
+      move = name;
+      action.reset().play();
+      action.crossFadeFrom(actions[controls.current], MOVE_FADE, false);
     }
 
-    function loadModel() {
-      new GLTFLoader().load("/models/gltf/Soldier.glb", (gltf) => {
-        if (disposed) return;
-
-        const model = gltf.scene;
-        group.add(model);
-        model.rotation.y = PI;
-        group.rotation.y = PI;
-
-        model.traverse((object) => {
-          if (!(object instanceof THREE.Mesh)) return;
-          const material = object.material as THREE.MeshStandardMaterial;
-
-          if (object.name == "vanguard_Mesh") {
-            object.castShadow = true;
-            object.receiveShadow = true;
-            material.metalness = 1.0;
-            material.roughness = 0.2;
-            material.color.set(1, 1, 1);
-            material.metalnessMap = material.map;
-          } else {
-            material.metalness = 1;
-            material.roughness = 0;
-            material.transparent = true;
-            material.opacity = 0.8;
-            material.color.set(1, 1, 1);
-          }
-        });
-
-        skeleton = new THREE.SkeletonHelper(model);
-        skeleton.setColors(new THREE.Color(0xe000ff), new THREE.Color(0x00e0ff));
-        skeleton.visible = false;
-        scene.add(skeleton);
-
-        createPanel();
-
-        const animations = gltf.animations;
-
-        mixer = new THREE.AnimationMixer(model);
-
-        actions = {
-          Idle: mixer.clipAction(animations[CLIP_INDEX.Idle]),
-          Walk: mixer.clipAction(animations[CLIP_INDEX.Walk]),
-          Run: mixer.clipAction(animations[CLIP_INDEX.Run]),
-        };
-
-        for (const m of Object.keys(actions) as ActionName[]) {
-          actions[m].enabled = true;
-          actions[m].setEffectiveTimeScale(1);
-          if (m !== "Idle") actions[m].setEffectiveWeight(0);
-        }
-
-        actions.Idle.play();
-
-        remotes.setTemplate(gltf);
-      });
+    // ...and just before it ends, hands back to standing, walking or running, whichever the keys say now
+    function endMove() {
+      const action = move && actions?.[move];
+      move = null;
+      if (!actions || !action) return;
+      const next = actions[controls.current];
+      next.reset().play();
+      next.crossFadeFrom(action, MOVE_FADE, false);
     }
 
     function updateCharacter(delta: number) {
@@ -315,9 +348,13 @@ export default function WalkScene() {
       const active = key[0] === 0 && key[1] === 0 ? false : true;
       const play: ActionName = active ? (key[2] ? "Run" : "Walk") : "Idle";
 
-      // change animation
+      // change animation (during a move, only note what to hand back to)
 
-      if (actions && controls.current != play) {
+      if (actions && move) {
+        controls.current = play;
+        const action = actions[move]!;
+        if (!action.isRunning() || action.time >= action.getClip().duration - MOVE_FADE) endMove();
+      } else if (actions && controls.current != play) {
         const current = actions[play];
         const old = actions[controls.current];
         controls.current = play;
@@ -355,10 +392,21 @@ export default function WalkScene() {
         // apply camera angle on ease
         controls.ease.applyAxisAngle(up, azimuth);
 
-        // stay inside the square map; the camera follows by however far the player really moved
+        // stay out of tree trunks and rocks and inside the square map;
+        // the camera follows by however far the player really moved
         const limit = MAP_HALF - PLAYER_RADIUS;
         const moved = controls.moved.copy(position);
         position.add(ease);
+        for (const obstacle of obstacles) {
+          const dx = position.x - obstacle.x;
+          const dz = position.z - obstacle.z;
+          const reach = obstacle.radius + PLAYER_RADIUS;
+          const distance = Math.hypot(dx, dz);
+          if (distance >= reach || distance === 0) continue;
+          // slide along the obstacle instead of stopping dead
+          position.x = obstacle.x + (dx / distance) * reach;
+          position.z = obstacle.z + (dz / distance) * reach;
+        }
         position.x = THREE.MathUtils.clamp(position.x, -limit, limit);
         position.z = THREE.MathUtils.clamp(position.z, -limit, limit);
         camera.position.add(moved.subVectors(position, moved));
@@ -370,6 +418,7 @@ export default function WalkScene() {
       }
 
       if (mixer) mixer.update(delta);
+      if (actions) feet?.update(mixamoWeight(actions));
 
       orbitControls.update();
     }
@@ -389,6 +438,7 @@ export default function WalkScene() {
     }
 
     function onKeyDown(event: KeyboardEvent) {
+      if (!joined) return;
       const key = controls.key;
       switch (event.code) {
         case "ArrowUp": case "KeyW": case "KeyZ": key[0] = -1; break;
@@ -396,6 +446,11 @@ export default function WalkScene() {
         case "ArrowLeft": case "KeyA": case "KeyQ": key[1] = -1; break;
         case "ArrowRight": case "KeyD": key[1] = 1; break;
         case "ShiftLeft": case "ShiftRight": key[2] = 1; break;
+        case "Space":
+          // keep Space from scrolling the page or pressing a focused button
+          event.preventDefault();
+          if (!event.repeat) startMove("Slash");
+          break;
       }
     }
 
@@ -414,6 +469,7 @@ export default function WalkScene() {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      labelRenderer.setSize(window.innerWidth, window.innerHeight);
     }
 
     function animate() {
@@ -430,10 +486,13 @@ export default function WalkScene() {
         x: controls.position.x,
         z: controls.position.z,
         yaw,
-        anim: controls.current,
+        anim: move ?? controls.current,
       });
 
+      sky.follow(camera);
+      monument.update(timer.getElapsed());
       renderer.render(scene, camera);
+      labelRenderer.render(scene, camera);
 
       viewDirection.subVectors(orbitControls.target, camera.position);
       radar.draw(
@@ -454,22 +513,23 @@ export default function WalkScene() {
 
     // DEMO
 
-    new HDRLoader().setPath("/textures/equirectangular/").load("lobe.hdr", (texture) => {
-      if (disposed) {
-        texture.dispose();
-        return;
-      }
+    createPanel();
 
-      texture.mapping = THREE.EquirectangularReflectionMapping;
-      scene.environment = texture;
-      scene.environmentIntensity = 1.5;
-
-      loadModel();
-      addFloor();
-    });
+    // preview the character picked last time, then let the join screen appear
+    showCharacter(loadSavedProfile()?.character ?? DEFAULT_CHARACTER, (fraction) => {
+      if (!disposed) setLoadProgress(fraction);
+    })
+      .catch((error) => {
+        console.error("Could not load the character model", error);
+        if (!disposed) setLoadFailed(true);
+      })
+      .finally(() => {
+        if (!disposed) setSceneReady(true);
+      });
 
     return () => {
       disposed = true;
+      sceneApiRef.current = null;
 
       window.removeEventListener("resize", onWindowResize);
       document.removeEventListener("keydown", onKeyDown);
@@ -496,11 +556,11 @@ export default function WalkScene() {
           }
         }
       });
-      scene.environment?.dispose();
       skeleton?.dispose();
 
       renderer.dispose();
       renderer.domElement.remove();
+      labelRenderer.domElement.remove();
     };
   }, []);
 
@@ -514,32 +574,55 @@ export default function WalkScene() {
         style={{ width: RADAR_SIZE, height: RADAR_SIZE }}
       />
       <div className="pointer-events-none absolute inset-x-0 top-0 p-2.5 text-center font-mono text-[13px] leading-snug text-white select-none">
+        {/* dark backing keeps the text readable over bright sky and foliage */}
+        <div className="inline-block rounded-lg bg-black/45 px-3 py-1.5 backdrop-blur-sm">
         <a
-          className="pointer-events-auto text-[#f00]"
+          className="pointer-events-auto text-red-400"
           href="https://threejs.org"
           target="_blank"
           rel="noopener"
         >
           three.js
         </a>{" "}
-        - Skeletal Animation Walking (model from{" "}
+        - Skeletal Animation Walking (model by{" "}
         <a
-          className="pointer-events-auto text-[#f00]"
-          href="https://www.mixamo.com/"
+          className="pointer-events-auto text-red-400"
+          href="https://quaternius.com/"
           target="_blank"
           rel="noopener"
         >
-          mixamo.com
+          Quaternius
         </a>
         )
         <br />
-        WASD / arrows to move, Shift to run, drag to orbit the camera
+        WASD / arrows to move, Shift to run, Space to slash, drag to orbit the camera
         <br />
         <span className={status === "online" ? "text-emerald-300" : "text-amber-300"}>
           {STATUS_TEXT[status]}
           {status === "online" && ` · ${playerCount} ${playerCount === 1 ? "player" : "players"}`}
         </span>
+        </div>
       </div>
+      {!sceneReady && (
+        <p className="absolute inset-x-0 bottom-8 text-center text-sm text-white/80">
+          Loading character…{loadProgress !== null && ` ${Math.round(loadProgress * 100)}%`}
+        </p>
+      )}
+      {loadFailed && !joined && (
+        <p className="absolute inset-x-0 top-24 text-center text-sm text-rose-200">
+          Could not load the character. Check your connection, then refresh the page.
+        </p>
+      )}
+      {sceneReady && !joined && (
+        <JoinModal
+          status={status}
+          takenNames={takenNames}
+          joining={joining}
+          serverError={joinError}
+          onPreview={(character) => sceneApiRef.current?.preview(character)}
+          onSubmit={(name, character) => sceneApiRef.current?.join(name, character)}
+        />
+      )}
     </div>
   );
 }

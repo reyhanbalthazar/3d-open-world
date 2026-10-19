@@ -1,3 +1,4 @@
+import type { Obstacle } from "./terrain-layout";
 import { MAP_HALF, MAP_SIZE } from "./world";
 
 export interface RadarMarker {
@@ -18,8 +19,19 @@ export class Radar {
   private ctx: CanvasRenderingContext2D;
   private size: number;
   private scale: number;
+  // trees and rocks, drawn as small dots
+  private obstacles: readonly Obstacle[];
+  // the monument, drawn as a glowing diamond
+  private landmark: { x: number; z: number } | undefined;
 
-  constructor(canvas: HTMLCanvasElement, size: number) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    size: number,
+    obstacles: readonly Obstacle[] = [],
+    landmark?: { x: number; z: number },
+  ) {
+    this.obstacles = obstacles;
+    this.landmark = landmark;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = canvas.height = Math.round(size * dpr);
 
@@ -50,6 +62,30 @@ export class Radar {
     ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
     ctx.lineWidth = 1.5;
     ctx.strokeRect(PADDING, PADDING, size - PADDING * 2, size - PADDING * 2);
+
+    ctx.fillStyle = "rgba(140, 200, 120, 0.55)";
+    ctx.beginPath();
+    for (const obstacle of this.obstacles) {
+      const [ox, oy] = this.toRadar(obstacle.x, obstacle.z);
+      ctx.moveTo(ox + 1.6, oy);
+      ctx.arc(ox, oy, 1.6, 0, Math.PI * 2);
+    }
+    ctx.fill();
+
+    if (this.landmark) {
+      const [lx, ly] = this.toRadar(this.landmark.x, this.landmark.z);
+      ctx.beginPath();
+      ctx.moveTo(lx, ly - 6);
+      ctx.lineTo(lx + 4.5, ly);
+      ctx.lineTo(lx, ly + 6);
+      ctx.lineTo(lx - 4.5, ly);
+      ctx.closePath();
+      ctx.fillStyle = "#6fe3ff";
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.7)";
+      ctx.stroke();
+    }
 
     // what the camera is looking at
     const [sx, sy] = this.toRadar(self.x, self.z);

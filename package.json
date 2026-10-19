@@ -10,7 +10,9 @@
     "dev": "node --watch-path=server server/index.ts --dev",
     "build": "next build",
     "start": "node server/index.ts",
-    "lint": "eslint"
+    "lint": "eslint",
+    "assets:nature": "node scripts/prepare-nature-assets.ts",
+    "assets:animations": "node scripts/bake-mixamo-animations.ts"
   },
   "dependencies": {
     "@types/three": "^0.186.0",
@@ -28,6 +30,7 @@
     "@types/ws": "^8.18.2",
     "eslint": "^9",
     "eslint-config-next": "16.4.2",
+    "sharp": "^0.35.5",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

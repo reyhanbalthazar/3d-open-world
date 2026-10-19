@@ -10,7 +10,9 @@ import { attachGameServer } from "./game.ts";
 
 const dev = process.argv.includes("--dev");
 const port = Number(process.env.PORT ?? 3000);
-const hostname = process.env.HOST ?? "0.0.0.0";
+// Unset means Node's default: every IPv6 and IPv4 address (IPv4 only on machines without IPv6).
+// Binding "0.0.0.0" would drop IPv6, and Firefox reaches "localhost" over ::1 first.
+const hostname = process.env.HOST;
 
 const server = createServer((req, res) => handle(req, res));
 const app = next({ dev, port, httpServer: server });
