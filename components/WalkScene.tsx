@@ -2,14 +2,20 @@
 
 // Port of https://threejs.org/examples/#webgl_animation_walk (MIT, three.js authors).
 
+// @refresh reset
+// The whole game (world, connection, key handling) lives in one effect, and Fast Refresh keeps an
+// existing effect running when the code changes. Without this, an open tab in development keeps
+// running old game code under new UI; with it, every edit remounts the game (back to the join screen).
+
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { SunLight } from "three/addons/lights/SunLight.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GUI } from "three/addons/libs/lil-gui.module.min.js";
 import { CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
+import HuntingScore from "@/components/HuntingScore";
 import JoinModal from "@/components/JoinModal";
-import type { MixamoAnimationName } from "@/lib/animation-catalog";
+import { MIXAMO_ANIMATIONS, type MixamoAnimationName } from "@/lib/animation-catalog";
 import {
   createActions,
   createFootPins,
@@ -20,19 +26,49 @@ import {
 } from "@/lib/character-models";
 import { DEFAULT_CHARACTER, type CharacterId } from "@/lib/characters";
 import { connectMultiplayer, type ConnectionStatus } from "@/lib/multiplayer";
+import { BreakableWorld } from "@/lib/breakables";
+import { Debris } from "@/lib/effects";
 import { addNature, createGround } from "@/lib/nature";
 import { loadSavedProfile, saveProfile, type SavedProfile } from "@/lib/profile";
-import type { JoinErrorReason, LocomotionName as ActionName } from "@/lib/protocol";
+import {
+  MAX_BREAKS_PER_SWING,
+  POINTS,
+  TOOL_NAMES,
+  TOOLS,
+  type JoinErrorReason,
+  type LocomotionName as ActionName,
+  type PlayerState,
+  type ToolName,
+} from "@/lib/protocol";
 import { Radar } from "@/lib/radar";
-import { RemotePlayers } from "@/lib/remote-players";
+import { RemotePlayers, type Standing } from "@/lib/remote-players";
+import { showScorePopup } from "@/lib/score-popups";
 import { createMonument, MONUMENT_OBSTACLES, MONUMENT_POSITION } from "@/lib/monument";
 import { createSky, HORIZON_COLOR } from "@/lib/sky";
 import { CLEARING_RADIUS, generateTerrainLayout } from "@/lib/terrain-layout";
+import { attachTools, showTool, TOOL_LABELS, TOOL_TARGETS } from "@/lib/tools";
 import { MAP_HALF, MAP_SIZE, PLAYER_RADIUS, yawFromQuaternion } from "@/lib/world";
 
 const RADAR_SIZE = 176;
+// our arrow on the radar and our dot on the scoreboard (other players get a colour of their own)
+const SELF_COLOR = "#ffffff";
 // seconds to blend into and back out of a move like the sword slash
 const MOVE_FADE = 0.2;
+// when the swing lands, measured from the animation by scripts/bake-mixamo-animations.ts
+const SLASH_IMPACT_TIME = MIXAMO_ANIMATIONS.find((animation) => animation.name === "Slash")!.impactTime;
+// a swing reaches things within 70 degrees either side of where the character faces
+const SWING_ARC_COS = Math.cos(THREE.MathUtils.degToRad(70));
+// blows a tree takes before it falls
+const AXE_BLOWS_TO_FELL = 3;
+// number keys pick a tool; pressing the same one again puts it away
+const TOOL_KEYS: Record<string, ToolName> = {
+  Digit1: "hammer",
+  Numpad1: "hammer",
+  Digit2: "axe",
+  Numpad2: "axe",
+  Digit3: "sickle",
+  Numpad3: "sickle",
+};
 const SUN_COLOR = 0xfff0d6;
 const SUN_DIRECTION = new THREE.Vector3(0.6, 0.7, 0.35).normalize();
 // ground beyond the map edge, far enough that its end is always lost in the fog
@@ -77,6 +113,8 @@ export default function WalkScene() {
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
   const [joinError, setJoinError] = useState<JoinErrorReason | null>(null);
+  const [heldTool, setHeldTool] = useState<ToolName | null>(null);
+  const [scoreboard, setScoreboard] = useState<{ self: Standing; others: Standing[] } | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -94,6 +132,14 @@ export default function WalkScene() {
     let feet: ReturnType<typeof createFootPins> | undefined;
     // the move playing right now (e.g. "Slash"), if any
     let move: MixamoAnimationName | null = null;
+    // whether the current move's swing has already landed
+    let moveLanded = false;
+    let tools: Record<ToolName, THREE.Object3D> | undefined;
+    let tool: ToolName | null = null;
+    // what E takes out again
+    let lastTool: ToolName = "hammer";
+    // our id on the game server, to recognise our own breaks when the server echoes them
+    let selfId: string | null = null;
     let panel: GUI | undefined;
 
     const settings = {
@@ -206,23 +252,83 @@ export default function WalkScene() {
     const radar = new Radar(radarCanvas, RADAR_SIZE, terrain.obstacles, MONUMENT_POSITION);
     const viewDirection = new THREE.Vector3();
 
+    // TOOLS: the server decides what is broken; a swing only asks it
+    const debris = new Debris(scene);
+
+    // At the moment the swing lands, the tool in hand works on what is in front of us: the hammer
+    // breaks the nearest rock, the axe chops the nearest tree (it falls on the last blow) and the
+    // sickle cuts every plant within reach. It shows on our screen straight away; the server
+    // confirms it for everyone (or puts things back).
+    function toolBlow(held: ToolName) {
+      const { breaks, reach } = TOOLS[held];
+      const { x, z } = controls.position;
+      const targets = world.inFront(breaks, x, z, yawFromQuaternion(group.quaternion), reach, SWING_ARC_COS);
+      if (targets.length === 0) return;
+
+      const ids = held === "sickle" ? targets.slice(0, MAX_BREAKS_PER_SWING).map((target) => target.id) : [targets[0].id];
+      if (held === "axe" && world.hit(ids[0], x, z) < AXE_BLOWS_TO_FELL) return;
+      for (const id of ids) world.break(id, { x, z }, true);
+      net.breakThings(ids, currentState());
+    }
+
+    // "+N" over what we broke, once the server has counted it
+    function popPoints(ids: number[]) {
+      const targets = ids.flatMap((id) => world.get(id) ?? []);
+      if (targets.length === 0) return;
+      let points = 0;
+      let x = 0;
+      let z = 0;
+      for (const target of targets) {
+        points += POINTS[target.kind];
+        x += target.x;
+        z += target.z;
+      }
+      showScorePopup(scene, x / targets.length, z / targets.length, points);
+    }
+
     // MULTIPLAYER
 
     const remotes = new RemotePlayers(scene);
+    // our Hunting Score, as the server last counted it
+    let score = 0;
     const refreshPlayers = () => {
       setPlayerCount(remotes.count + (joined ? 1 : 0));
       setTakenNames(remotes.names());
+      if (joined && selfId && profile) {
+        setScoreboard({ self: { id: selfId, name: profile.name, color: SELF_COLOR, score }, others: remotes.standings() });
+      }
     };
 
     const net = connectMultiplayer({
-      onWelcome(players) {
+      onWelcome(players, broken) {
         remotes.clear();
         for (const player of players) remotes.add(player);
         refreshPlayers();
+        // match what the server says is broken, e.g. after a reconnect
+        world.sync(broken);
       },
-      onJoined() {
+      onBroken(ids, by, total) {
+        // what we broke ourselves is already broken on our screen
+        const mine = by === selfId;
+        const from = mine ? controls.position : remotes.positionOf(by);
+        for (const id of ids) world.break(id, from, true);
+        if (mine) {
+          score = total;
+          popPoints(ids);
+        } else {
+          remotes.setScore(by, total);
+        }
+        refreshPlayers();
+      },
+      onRestored(ids) {
+        for (const id of ids) world.restore(id, true);
+      },
+      onJoined(id, points, token) {
+        selfId = id;
         joined = true;
-        if (profile) saveProfile(profile);
+        score = points;
+        // the token brings our score back if we reload the page and join under the same name
+        if (profile) saveProfile({ ...profile, token });
         setJoined(true);
         setJoining(false);
         refreshPlayers();
@@ -260,7 +366,8 @@ export default function WalkScene() {
         setJoining(true);
         setJoinError(null);
         void showCharacter(character);
-        net.join(name, character);
+        // someone coming back under the same name gets their score back with the token saved last time
+        net.join(name, character, loadSavedProfile()?.token);
       },
     };
 
@@ -270,7 +377,8 @@ export default function WalkScene() {
     scene.add(
       createGround(MAP_SIZE + GROUND_MARGIN * 2, terrain.paths, CLEARING_RADIUS, renderer.capabilities.getMaxAnisotropy()),
     );
-    void addNature(scene, terrain.placements, () => disposed);
+    const nature = addNature(scene, terrain.placements, () => disposed);
+    const world = new BreakableWorld(scene, nature, terrain.breakables, terrain.obstacles, debris);
 
     const monument = createMonument();
     scene.add(monument.object);
@@ -305,6 +413,8 @@ export default function WalkScene() {
       mixer = new THREE.AnimationMixer(model);
       actions = createActions(mixer, gltf.animations);
       feet = createFootPins(model);
+      tools = attachTools(model);
+      showTool(tools, tool);
 
       for (const m of ["Idle", "Walk", "Run"] as const) {
         actions[m].enabled = true;
@@ -322,6 +432,7 @@ export default function WalkScene() {
       const action = actions?.[name];
       if (!actions || !action || move) return;
       move = name;
+      moveLanded = false;
       action.reset().play();
       action.crossFadeFrom(actions[controls.current], MOVE_FADE, false);
     }
@@ -334,6 +445,24 @@ export default function WalkScene() {
       const next = actions[controls.current];
       next.reset().play();
       next.crossFadeFrom(action, MOVE_FADE, false);
+    }
+
+    // Puts a tool in the hand, or puts it away (null).
+    function holdTool(next: ToolName | null) {
+      tool = next;
+      if (next) lastTool = next;
+      if (tools) showTool(tools, next);
+      setHeldTool(next);
+    }
+
+    function currentState(): PlayerState {
+      return {
+        x: controls.position.x,
+        z: controls.position.z,
+        yaw: yawFromQuaternion(group.quaternion),
+        anim: move ?? controls.current,
+        tool,
+      };
     }
 
     function updateCharacter(delta: number) {
@@ -353,6 +482,11 @@ export default function WalkScene() {
       if (actions && move) {
         controls.current = play;
         const action = actions[move]!;
+        // the swing lands: with a tool in hand, that is when it works on what is in front of us
+        if (!moveLanded && action.time >= SLASH_IMPACT_TIME) {
+          moveLanded = true;
+          if (tool) toolBlow(tool);
+        }
         if (!action.isRunning() || action.time >= action.getClip().duration - MOVE_FADE) endMove();
       } else if (actions && controls.current != play) {
         const current = actions[play];
@@ -398,6 +532,7 @@ export default function WalkScene() {
         const moved = controls.moved.copy(position);
         position.add(ease);
         for (const obstacle of obstacles) {
+          if (obstacle.disabled) continue;
           const dx = position.x - obstacle.x;
           const dz = position.z - obstacle.z;
           const reach = obstacle.radius + PLAYER_RADIUS;
@@ -439,6 +574,11 @@ export default function WalkScene() {
 
     function onKeyDown(event: KeyboardEvent) {
       if (!joined) return;
+      const keyTool = TOOL_KEYS[event.code];
+      if (keyTool) {
+        if (!event.repeat) holdTool(tool === keyTool ? null : keyTool);
+        return;
+      }
       const key = controls.key;
       switch (event.code) {
         case "ArrowUp": case "KeyW": case "KeyZ": key[0] = -1; break;
@@ -446,6 +586,10 @@ export default function WalkScene() {
         case "ArrowLeft": case "KeyA": case "KeyQ": key[1] = -1; break;
         case "ArrowRight": case "KeyD": key[1] = 1; break;
         case "ShiftLeft": case "ShiftRight": key[2] = 1; break;
+        case "KeyE":
+          // puts the tool away, or takes the last one out again
+          if (!event.repeat) holdTool(tool ? null : lastTool);
+          break;
         case "Space":
           // keep Space from scrolling the page or pressing a focused button
           event.preventDefault();
@@ -482,21 +626,18 @@ export default function WalkScene() {
 
       const yaw = yawFromQuaternion(group.quaternion);
 
-      net.sendState({
-        x: controls.position.x,
-        z: controls.position.z,
-        yaw,
-        anim: move ?? controls.current,
-      });
+      net.sendState(currentState());
 
       sky.follow(camera);
       monument.update(timer.getElapsed());
+      world.update(delta);
+      debris.update(delta);
       renderer.render(scene, camera);
       labelRenderer.render(scene, camera);
 
       viewDirection.subVectors(orbitControls.target, camera.position);
       radar.draw(
-        { x: controls.position.x, z: controls.position.z, yaw, color: "#ffffff" },
+        { x: controls.position.x, z: controls.position.z, yaw, color: SELF_COLOR },
         viewDirection.x,
         viewDirection.z,
         remotes.markers(),
@@ -530,6 +671,8 @@ export default function WalkScene() {
     return () => {
       disposed = true;
       sceneApiRef.current = null;
+      world.dispose();
+      debris.dispose();
 
       window.removeEventListener("resize", onWindowResize);
       document.removeEventListener("keydown", onKeyDown);
@@ -595,7 +738,7 @@ export default function WalkScene() {
         </a>
         )
         <br />
-        WASD / arrows to move, Shift to run, Space to slash, drag to orbit the camera
+        WASD / arrows to move, Shift to run, 1-3 for tools, Space to swing, drag to orbit the camera
         <br />
         <span className={status === "online" ? "text-emerald-300" : "text-amber-300"}>
           {STATUS_TEXT[status]}
@@ -612,6 +755,33 @@ export default function WalkScene() {
         <p className="absolute inset-x-0 top-24 text-center text-sm text-rose-200">
           Could not load the character. Check your connection, then refresh the page.
         </p>
+      )}
+      {joined && scoreboard && <HuntingScore self={scoreboard.self} others={scoreboard.others} />}
+      {joined && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-4 flex flex-col items-center gap-2 select-none">
+          <p className="rounded-full bg-black/45 px-3 py-1 font-mono text-[12px] text-white/85 backdrop-blur-sm">
+            {heldTool
+              ? `Space: swing the ${TOOL_LABELS[heldTool].toLowerCase()} at ${TOOL_TARGETS[heldTool].toLowerCase()} · E: put it away`
+              : "Press 1-3 to take out a tool"}
+          </p>
+          <ul className="flex gap-2" aria-label="Tools">
+            {TOOL_NAMES.map((name, index) => (
+              <li
+                key={name}
+                aria-current={heldTool === name}
+                className={`flex min-w-[96px] flex-col items-center rounded-xl border px-3 py-1.5 backdrop-blur-sm transition-colors ${
+                  heldTool === name ? "border-amber-200 bg-amber-500/90 text-zinc-950" : "border-white/15 bg-black/50 text-white/85"
+                }`}
+              >
+                <span className="font-mono text-[11px] opacity-70">{index + 1}</span>
+                <span className="text-sm font-semibold">{TOOL_LABELS[name]}</span>
+                <span className="text-[11px] opacity-75">
+                  {TOOL_TARGETS[name]} · +{POINTS[TOOLS[name].breaks]}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
       {sceneReady && !joined && (
         <JoinModal

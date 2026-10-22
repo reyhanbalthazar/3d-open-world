@@ -7,15 +7,17 @@ const STORAGE_KEY = "3d-open-world:profile";
 export interface SavedProfile {
   name: string;
   character: CharacterId;
+  // from the game server on joining: brings the Hunting Score back after reloading the page
+  token?: string;
 }
 
 export function loadSavedProfile(): SavedProfile | null {
   try {
     const saved: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
     if (!saved || typeof saved !== "object") return null;
-    const { name, character } = saved as Record<string, unknown>;
+    const { name, character, token } = saved as Record<string, unknown>;
     if (typeof name !== "string" || !isCharacterId(character)) return null;
-    return { name, character };
+    return { name, character, token: typeof token === "string" ? token : undefined };
   } catch {
     return null;
   }

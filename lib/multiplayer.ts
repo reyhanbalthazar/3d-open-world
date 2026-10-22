@@ -11,13 +11,17 @@ import {
 export type ConnectionStatus = "connecting" | "online" | "offline";
 
 interface MultiplayerHandlers {
-  // everyone already playing, sent on every (re)connect
-  onWelcome(players: PlayerInfo[]): void;
-  onJoined(id: string): void;
+  // everyone already playing and everything broken right now, sent on every (re)connect
+  onWelcome(players: PlayerInfo[], broken: number[]): void;
+  // score: our Hunting Score, carried over if we came back; token: what brings it back next time
+  onJoined(id: string, score: number, token: string): void;
   onJoinError(reason: JoinErrorReason): void;
   onPlayerJoined(player: PlayerInfo): void;
   onState(id: string, state: PlayerState): void;
   onLeave(id: string): void;
+  // by: who broke them; score: their Hunting Score now
+  onBroken(ids: number[], by: string, score: number): void;
+  onRestored(ids: number[]): void;
   onStatus(status: ConnectionStatus): void;
 }
 
@@ -30,7 +34,7 @@ const CONNECT_TIMEOUT_MS = 10_000;
 const REJOIN_RETRY_MS = 3000;
 
 function sameState(a: PlayerState, b: PlayerState) {
-  return a.x === b.x && a.z === b.z && a.yaw === b.yaw && a.anim === b.anim;
+  return a.x === b.x && a.z === b.z && a.yaw === b.yaw && a.anim === b.anim && a.tool === b.tool;
 }
 
 // Connects to the game server on the same host and port that served the page, reconnecting until closed.
@@ -39,7 +43,7 @@ export function connectMultiplayer(handlers: MultiplayerHandlers) {
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let rejoinTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
-  let identity: { name: string; character: CharacterId } | undefined;
+  let identity: { name: string; character: CharacterId; token?: string } | undefined;
   let joined = false;
   let everJoined = false;
   let lastSent: PlayerState | undefined;
@@ -76,12 +80,14 @@ export function connectMultiplayer(handlers: MultiplayerHandlers) {
       const message = JSON.parse(event.data as string) as ServerMessage;
       switch (message.type) {
         case "welcome":
-          handlers.onWelcome(message.players);
+          handlers.onWelcome(message.players, message.broken);
           break;
         case "joined":
           joined = true;
           everJoined = true;
-          handlers.onJoined(message.id);
+          // rejoining after a dropped connection shows it, so we keep our score
+          if (identity) identity.token = message.token;
+          handlers.onJoined(message.id, message.score, message.token);
           break;
         case "join_error":
           if (everJoined) {
@@ -96,12 +102,18 @@ export function connectMultiplayer(handlers: MultiplayerHandlers) {
           handlers.onPlayerJoined(message.player);
           break;
         case "state": {
-          const { id, x, z, yaw, anim } = message;
-          handlers.onState(id, { x, z, yaw, anim });
+          const { id, x, z, yaw, anim, tool } = message;
+          handlers.onState(id, { x, z, yaw, anim, tool });
           break;
         }
         case "leave":
           handlers.onLeave(message.id);
+          break;
+        case "broken":
+          handlers.onBroken(message.ids, message.by, message.score);
+          break;
+        case "restored":
+          handlers.onRestored(message.ids);
           break;
       }
     };
@@ -120,8 +132,9 @@ export function connectMultiplayer(handlers: MultiplayerHandlers) {
 
   return {
     // Answered by onJoined or onJoinError. Reconnects re-send it automatically.
-    join(name: string, character: CharacterId) {
-      identity = { name, character };
+    // token: from an earlier onJoined (e.g. before a page reload), to get that score back
+    join(name: string, character: CharacterId, token?: string) {
+      identity = { name, character, token };
       sendJoin();
     },
 
@@ -136,6 +149,16 @@ export function connectMultiplayer(handlers: MultiplayerHandlers) {
       send({ type: "state", ...state });
       lastSent = { ...state };
       lastSentAt = now;
+    },
+
+    // The server answers with "broken" for everyone, and "restored" to us for whatever it refuses.
+    breakThings(ids: number[], current: PlayerState) {
+      if (!joined) return;
+      // the server judges the hit from our position, so make sure it has the latest one
+      send({ type: "state", ...current });
+      lastSent = { ...current };
+      lastSentAt = performance.now();
+      send({ type: "break", ids });
     },
 
     close() {

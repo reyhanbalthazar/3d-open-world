@@ -10,7 +10,8 @@ import {
   type CharacterActions,
 } from "./character-models";
 import type { CharacterId } from "./characters";
-import type { AnimName, LocomotionName, PlayerInfo, PlayerState } from "./protocol";
+import { attachTools, showTool } from "./tools";
+import type { AnimName, LocomotionName, PlayerInfo, PlayerState, ToolName } from "./protocol";
 import type { RadarMarker } from "./radar";
 import { yawFromQuaternion } from "./world";
 
@@ -25,6 +26,16 @@ interface Profile {
   character: CharacterId;
   // marker colour on the radar and the name tag
   color: string;
+  // Hunting Score
+  score: number;
+}
+
+// a row on the Hunting Score board
+export interface Standing {
+  id: string;
+  name: string;
+  color: string;
+  score: number;
 }
 
 interface RemotePlayer {
@@ -33,6 +44,7 @@ interface RemotePlayer {
   actions: CharacterActions;
   current: AnimName;
   feet: ReturnType<typeof createFootPins>;
+  tools: Record<ToolName, THREE.Object3D>;
   target: THREE.Vector3;
   targetRotation: THREE.Quaternion;
   label: CSS2DObject;
@@ -83,9 +95,19 @@ export class RemotePlayers {
     return [...this.profiles.values()].map((profile) => profile.name);
   }
 
+  standings(): Standing[] {
+    return [...this.profiles].map(([id, { name, color, score }]) => ({ id, name, color, score }));
+  }
+
   add(player: PlayerInfo) {
-    this.profiles.set(player.id, { name: player.name, character: player.character, color: colorFromId(player.id) });
-    if (player.state) this.upsert(player.id, player.state);
+    const { id, name, character, score } = player;
+    this.profiles.set(id, { name, character, color: colorFromId(id), score });
+    if (player.state) this.upsert(id, player.state);
+  }
+
+  setScore(id: string, score: number) {
+    const profile = this.profiles.get(id);
+    if (profile) profile.score = score;
   }
 
   upsert(id: string, state: PlayerState) {
@@ -93,6 +115,7 @@ export class RemotePlayers {
     if (player) {
       player.target.set(state.x, 0, state.z);
       player.targetRotation.setFromAxisAngle(UP, state.yaw);
+      showTool(player.tools, state.tool);
       this.play(player, state.anim);
       return;
     }
@@ -135,6 +158,11 @@ export class RemotePlayers {
     for (const id of [...this.profiles.keys()]) this.remove(id);
   }
 
+  // where a player stands right now, as drawn
+  positionOf(id: string) {
+    return this.players.get(id)?.group.position;
+  }
+
   *markers(): Generator<RadarMarker> {
     for (const player of this.players.values()) {
       const { position, quaternion } = player.group;
@@ -159,6 +187,8 @@ export class RemotePlayers {
 
   private spawn(id: string, profile: Profile, gltf: GLTF, state: PlayerState) {
     const model = instantiateCharacter(gltf);
+    const tools = attachTools(model);
+    showTool(tools, state.tool);
     const label = createLabel(profile);
 
     const group = new THREE.Group();
@@ -179,6 +209,7 @@ export class RemotePlayers {
       actions,
       current,
       feet: createFootPins(model),
+      tools,
       target: group.position.clone(),
       targetRotation: group.quaternion.clone(),
       label,

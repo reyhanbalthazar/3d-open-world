@@ -1,9 +1,11 @@
 import type { NatureModelId } from "./nature-catalog";
-import { MAP_HALF } from "./world";
+import type { BreakableKind } from "./protocol";
+// with the extension: server/game.ts runs this file directly in Node to know what can be broken where
+import { MAP_HALF } from "./world.ts";
 
 // Where every tree, rock, bush and patch of grass goes, and where the dirt paths run.
-// Generated from a fixed seed, so every player builds exactly the same world without the
-// server having to send it.
+// Generated from a fixed seed, so every player and the server build exactly the same world
+// without it having to be sent.
 
 const SEED = 20220519;
 // the middle of the map is a bare clearing around the monument (lib/monument.ts); nothing grows there
@@ -40,6 +42,21 @@ export interface Obstacle {
   x: number;
   z: number;
   radius: number;
+  // set when a tool can break what this obstacle belongs to (see Breakable)
+  breakableId?: number;
+  // set while it is broken: no collision, no radar dot
+  disabled?: boolean;
+}
+
+// Something a tool can break: a rock (hammer), a tree (axe) or a bush or smaller plant (sickle).
+// Its id is the index of its placement, the same on every client and the server.
+export interface Breakable {
+  id: number;
+  kind: BreakableKind;
+  x: number;
+  z: number;
+  // trunk or body radius: a tool reaches it when within reach of this edge
+  radius: number;
 }
 
 interface Scatter {
@@ -54,6 +71,10 @@ interface Scatter {
   pathClearance: number;
   // collision radius at scale 1
   obstacleRadius?: number;
+  // a tool can break the copies inside the map
+  breakable?: BreakableKind;
+  // for breakables without collision: their radius at scale 1, for the tool's reach
+  bodyRadius?: number;
   castShadow: boolean;
 }
 
@@ -144,6 +165,7 @@ export function generateTerrainLayout() {
 
   const placements: Placement[] = [];
   const obstacles: Obstacle[] = [];
+  const breakables: Breakable[] = [];
   const occupied: Array<{ x: number; z: number; radius: number }> = [];
 
   function point(area: Scatter["area"], pathClearance: number): [number, number] {
@@ -180,7 +202,14 @@ export function generateTerrainLayout() {
       const scale = range(...spec.scale);
       placements.push({ model: pick(spec.models), x, z, rotation: range(0, Math.PI * 2), scale, castShadow: spec.castShadow });
       if (radius > 0) occupied.push({ x, z, radius });
-      if (spec.obstacleRadius) obstacles.push({ x, z, radius: spec.obstacleRadius * scale });
+      // only what players can actually reach is breakable
+      const reachable = Math.abs(x) < MAP_HALF && Math.abs(z) < MAP_HALF;
+      const breakableId = spec.breakable && reachable ? placements.length - 1 : undefined;
+      if (spec.obstacleRadius) obstacles.push({ x, z, radius: spec.obstacleRadius * scale, breakableId });
+      if (spec.breakable && breakableId !== undefined) {
+        const bodyRadius = spec.obstacleRadius ?? spec.bodyRadius ?? 0.3;
+        breakables.push({ id: breakableId, kind: spec.breakable, x, z, radius: bodyRadius * scale });
+      }
       placed++;
     }
   }
@@ -191,19 +220,19 @@ export function generateTerrainLayout() {
   // The border sits in the fog, where shadows are not visible but would still cost a lot to render.
   scatter({ models: BORDER_TREES, count: 120, area: "border", scale: [1, 1.6], spacing: 3.2, pathClearance: edge + 2, castShadow: false });
   scatter({ models: ROCKS, count: 20, area: "border", scale: [1.2, 2.2], spacing: 1.5, pathClearance: edge + 1, castShadow: false });
-  scatter({ models: TREES, count: 30, area: "inside", scale: [0.9, 1.3], spacing: 5, pathClearance: edge + 2.5, obstacleRadius: 0.35, castShadow: true });
-  scatter({ models: DEAD_TREES, count: 3, area: "inside", scale: [0.9, 1.2], spacing: 5, pathClearance: edge + 2.5, obstacleRadius: 0.3, castShadow: true });
-  scatter({ models: ROCKS, count: 10, area: "path_edge", scale: [0.8, 1.6], spacing: 2, pathClearance: edge + 0.6, obstacleRadius: 0.45, castShadow: true });
-  scatter({ models: ROCKS, count: 12, area: "inside", scale: [1, 2.2], spacing: 2.5, pathClearance: edge + 1.5, obstacleRadius: 0.45, castShadow: true });
-  scatter({ models: BUSHES, count: 30, area: "path_edge", scale: [0.9, 1.4], spacing: 1.6, pathClearance: edge + 0.9, castShadow: true });
-  scatter({ models: BUSHES, count: 40, area: "inside", scale: [0.9, 1.5], spacing: 2, pathClearance: edge + 1, castShadow: true });
+  scatter({ models: TREES, count: 30, area: "inside", scale: [0.9, 1.3], spacing: 5, pathClearance: edge + 2.5, obstacleRadius: 0.35, breakable: "tree", castShadow: true });
+  scatter({ models: DEAD_TREES, count: 3, area: "inside", scale: [0.9, 1.2], spacing: 5, pathClearance: edge + 2.5, obstacleRadius: 0.3, breakable: "tree", castShadow: true });
+  scatter({ models: ROCKS, count: 10, area: "path_edge", scale: [0.8, 1.6], spacing: 2, pathClearance: edge + 0.6, obstacleRadius: 0.45, breakable: "rock", castShadow: true });
+  scatter({ models: ROCKS, count: 12, area: "inside", scale: [1, 2.2], spacing: 2.5, pathClearance: edge + 1.5, obstacleRadius: 0.45, breakable: "rock", castShadow: true });
+  scatter({ models: BUSHES, count: 30, area: "path_edge", scale: [0.9, 1.4], spacing: 1.6, pathClearance: edge + 0.9, breakable: "plant", bodyRadius: 0.55, castShadow: true });
+  scatter({ models: BUSHES, count: 40, area: "inside", scale: [0.9, 1.5], spacing: 2, pathClearance: edge + 1, breakable: "plant", bodyRadius: 0.55, castShadow: true });
   scatter({ models: BUSHES, count: 50, area: "border", scale: [1, 1.6], spacing: 1.5, pathClearance: edge + 0.5, castShadow: false });
-  scatter({ models: PLANTS, count: 30, area: "inside", scale: [0.9, 1.3], spacing: 1, pathClearance: edge + 0.5, castShadow: false });
+  scatter({ models: PLANTS, count: 30, area: "inside", scale: [0.9, 1.3], spacing: 1, pathClearance: edge + 0.5, breakable: "plant", bodyRadius: 0.45, castShadow: false });
   // flowers and grass crowd the path edges, then thin out across the meadow
-  scatter({ models: FLOWERS, count: 140, area: "path_edge", scale: [0.9, 1.4], spacing: 0, pathClearance: edge + 0.2, castShadow: false });
-  scatter({ models: GRASS, count: 260, area: "path_edge", scale: [1, 1.7], spacing: 0, pathClearance: edge, castShadow: false });
-  scatter({ models: FLOWERS, count: 90, area: "inside", scale: [0.8, 1.3], spacing: 0, pathClearance: edge, castShadow: false });
-  scatter({ models: GRASS, count: 600, area: "inside", scale: [0.9, 1.6], spacing: 0, pathClearance: edge - 0.3, castShadow: false });
+  scatter({ models: FLOWERS, count: 140, area: "path_edge", scale: [0.9, 1.4], spacing: 0, pathClearance: edge + 0.2, breakable: "plant", bodyRadius: 0.25, castShadow: false });
+  scatter({ models: GRASS, count: 260, area: "path_edge", scale: [1, 1.7], spacing: 0, pathClearance: edge, breakable: "plant", bodyRadius: 0.25, castShadow: false });
+  scatter({ models: FLOWERS, count: 90, area: "inside", scale: [0.8, 1.3], spacing: 0, pathClearance: edge, breakable: "plant", bodyRadius: 0.25, castShadow: false });
+  scatter({ models: GRASS, count: 600, area: "inside", scale: [0.9, 1.6], spacing: 0, pathClearance: edge - 0.3, breakable: "plant", bodyRadius: 0.25, castShadow: false });
 
-  return { placements, obstacles, paths };
+  return { placements, obstacles, paths, breakables };
 }

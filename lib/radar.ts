@@ -66,6 +66,8 @@ export class Radar {
     ctx.fillStyle = "rgba(140, 200, 120, 0.55)";
     ctx.beginPath();
     for (const obstacle of this.obstacles) {
+      // broken rocks
+      if (obstacle.disabled) continue;
       const [ox, oy] = this.toRadar(obstacle.x, obstacle.z);
       ctx.moveTo(ox + 1.6, oy);
       ctx.arc(ox, oy, 1.6, 0, Math.PI * 2);

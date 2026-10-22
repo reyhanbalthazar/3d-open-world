@@ -159,6 +159,8 @@ for (const animation of MIXAMO_ANIMATIONS) {
         .applyMatrix4(bindMatrix(`LowerLeg${side}`).invert()),
     }));
     const lowestFoot: number[] = [];
+    // wrist positions per frame, to find which hand swings and when it moves fastest (the hit)
+    const wrists = { L: [] as THREE.Vector3[], R: [] as THREE.Vector3[] };
 
     const frames = Math.round(sourceClip.duration * FPS) + 1;
     const times: number[] = [];
@@ -194,6 +196,21 @@ for (const animation of MIXAMO_ANIMATIONS) {
       model.updateMatrixWorld(true);
       const heights = ankles.map(({ shin, ankle }) => ankle.clone().applyMatrix4(shin.matrixWorld).y - targetFloorY);
       lowestFoot.push(Math.min(...heights));
+      wrists.L.push(worldPosition(bone(model, "WristL")));
+      wrists.R.push(worldPosition(bone(model, "WristR")));
+    }
+
+    for (const side of ["L", "R"] as const) {
+      let fastest = 0;
+      let fastestTime = 0;
+      for (let i = 1; i < frames; i++) {
+        const speed = wrists[side][i].distanceTo(wrists[side][i - 1]) * FPS;
+        if (speed > fastest) {
+          fastest = speed;
+          fastestTime = (times[i] + times[i - 1]) / 2;
+        }
+      }
+      console.log(`  ${animation.name} ${group}: hand ${side} fastest ${fastest.toFixed(1)} m/s at ${fastestTime.toFixed(2)} s`);
     }
 
     const tracks: THREE.KeyframeTrack[] = [

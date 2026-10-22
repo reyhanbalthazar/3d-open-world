@@ -75,53 +75,91 @@ function objMaterial(name: string, cache: Map<string, THREE.Material>) {
 }
 
 // Adds every placement to the scene, one InstancedMesh per model part, so hundreds of
-// trees and grass clumps cost a few dozen draw calls.
-export async function addNature(scene: THREE.Scene, placements: Placement[], isCancelled: () => boolean) {
-  const byModel = new Map<NatureModelId, Placement[]>();
-  for (const placement of placements) {
-    const list = byModel.get(placement.model) ?? [];
-    list.push(placement);
-    byModel.set(placement.model, list);
+// trees and grass clumps cost a few dozen draw calls. Models load in the background; the returned
+// controller can hide or move single placements (things broken with tools) at any time, even
+// before they have loaded.
+export function addNature(scene: THREE.Scene, placements: Placement[], isCancelled: () => boolean) {
+  // grouped by model and shadow casting, since border copies of a model skip shadows
+  const groups = new Map<string, { model: NatureModelId; castShadow: boolean; indices: number[] }>();
+  placements.forEach((placement, index) => {
+    const key = `${placement.model}|${placement.castShadow}`;
+    const group = groups.get(key) ?? { model: placement.model, castShadow: placement.castShadow, indices: [] };
+    group.indices.push(index);
+    groups.set(key, group);
+  });
+
+  // placement index -> the instance slots drawing it, and the matrix each slot shows when visible
+  const instances = new Map<number, Array<{ mesh: THREE.InstancedMesh; slot: number; matrix: THREE.Matrix4 }>>();
+  const hidden = new Set<number>();
+  // an extra world-space transform on top of a placement (a tree falling, a rock growing back)
+  const offsets = new Map<number, THREE.Matrix4>();
+  const collapsed = new THREE.Matrix4().makeScale(0, 0, 0);
+  const moved = new THREE.Matrix4();
+
+  function matrixFor(index: number, matrix: THREE.Matrix4) {
+    if (hidden.has(index)) return collapsed;
+    const offset = offsets.get(index);
+    return offset ? moved.multiplyMatrices(offset, matrix) : matrix;
+  }
+
+  function show(index: number) {
+    for (const { mesh, slot, matrix } of instances.get(index) ?? []) {
+      mesh.setMatrixAt(slot, matrixFor(index, matrix));
+      mesh.instanceMatrix.needsUpdate = true;
+    }
   }
 
   const objMaterials = new Map<string, THREE.Material>();
-  const matrix = new THREE.Matrix4();
   const position = new THREE.Vector3();
   const rotation = new THREE.Quaternion();
   const scale = new THREE.Vector3();
   const up = new THREE.Vector3(0, 1, 0);
 
-  await Promise.all(
-    [...byModel].map(async ([id, list]) => {
-      let template: THREE.Object3D;
-      try {
-        template = await loadModel(id, objMaterials);
-      } catch (error) {
-        console.error(`Could not load nature model "${id}"`, error);
-        return;
-      }
-      if (isCancelled()) return;
+  for (const { model, castShadow, indices } of groups.values()) {
+    loadModel(model, objMaterials).then(
+      (template) => {
+        if (isCancelled()) return;
 
-      tint(template);
-      template.updateMatrixWorld(true);
-      template.traverse((child) => {
-        if (!(child instanceof THREE.Mesh)) return;
+        tint(template);
+        template.updateMatrixWorld(true);
+        template.traverse((child) => {
+          if (!(child instanceof THREE.Mesh)) return;
 
-        const mesh = new THREE.InstancedMesh(child.geometry, child.material, list.length);
-        list.forEach((placement, i) => {
-          position.set(placement.x, 0, placement.z);
-          rotation.setFromAxisAngle(up, placement.rotation);
-          scale.setScalar(placement.scale);
-          matrix.compose(position, rotation, scale).multiply(child.matrixWorld);
-          mesh.setMatrixAt(i, matrix);
+          const mesh = new THREE.InstancedMesh(child.geometry, child.material, indices.length);
+          indices.forEach((index, slot) => {
+            const placement = placements[index];
+            position.set(placement.x, 0, placement.z);
+            rotation.setFromAxisAngle(up, placement.rotation);
+            scale.setScalar(placement.scale);
+            const matrix = new THREE.Matrix4().compose(position, rotation, scale).multiply(child.matrixWorld);
+            mesh.setMatrixAt(slot, matrixFor(index, matrix));
+            const list = instances.get(index) ?? [];
+            list.push({ mesh, slot, matrix });
+            instances.set(index, list);
+          });
+          mesh.castShadow = castShadow;
+          mesh.receiveShadow = true;
+          mesh.computeBoundingSphere();
+          scene.add(mesh);
         });
-        mesh.castShadow = list[0].castShadow;
-        mesh.receiveShadow = true;
-        mesh.computeBoundingSphere();
-        scene.add(mesh);
-      });
-    }),
-  );
+      },
+      (error) => console.error(`Could not load nature model "${model}"`, error),
+    );
+  }
+
+  return {
+    setHidden(index: number, value: boolean) {
+      if (value) hidden.add(index);
+      else hidden.delete(index);
+      show(index);
+    },
+    // null puts the placement back where it was laid out
+    setTransform(index: number, transform: THREE.Matrix4 | null) {
+      if (transform) offsets.set(index, transform.clone());
+      else offsets.delete(index);
+      show(index);
+    },
+  };
 }
 
 // The ground is one painted texture: sunny grass with soft lighter and darker patches, and dirt
